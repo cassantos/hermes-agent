@@ -1197,11 +1197,20 @@ async def _standalone_send(
     force_document=False,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
-    standalone_sender_fn contract; replaces the legacy _send_email helper."""
+    standalone_sender_fn contract; replaces the legacy _send_email helper.
+
+    Minimal behavior: if *media_files* is provided and is an iterable of
+    local file paths, attach each file as a MIME attachment. Otherwise send
+    a plain text message as before. This function makes no other changes.
+    """
     import smtplib
     import ssl as _ssl
     from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email.mime.multipart import MIMEMultipart
     from email.utils import formatdate
+    from email import encoders
+    from pathlib import Path
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
@@ -1216,11 +1225,35 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
-        msg["From"] = address
-        msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
-        msg["Date"] = formatdate(localtime=True)
+        # If media_files provided, build a multipart message with attachments
+        if media_files:
+            msg = MIMEMultipart()
+            msg["From"] = address
+            msg["To"] = chat_id
+            msg["Subject"] = "Hermes Agent"
+            msg["Date"] = formatdate(localtime=True)
+
+            # Attach the main body
+            msg.attach(MIMEText(message or "", "plain", "utf-8"))
+
+            # Attach each provided file path
+            for file_path in media_files:
+                p = Path(file_path)
+                if not p.exists():
+                    # Skip missing files silently to preserve minimal changes
+                    continue
+                with p.open("rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header("Content-Disposition", f'attachment; filename="{p.name}"')
+                    msg.attach(part)
+        else:
+            msg = MIMEText(message, "plain", "utf-8")
+            msg["From"] = address
+            msg["To"] = chat_id
+            msg["Subject"] = "Hermes Agent"
+            msg["Date"] = formatdate(localtime=True)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
@@ -1234,7 +1267,6 @@ async def _standalone_send(
             return _e(f"Email send failed: {e}")
         except Exception:
             return {"error": f"Email send failed: {e}"}
-
 
 def _is_connected(config) -> bool:
     """Email is connected when an address is configured (in PlatformConfig.extra

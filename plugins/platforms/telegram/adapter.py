@@ -8134,9 +8134,136 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
+
+        # ------------------------------------------------------------------
+        # Direct inbox-capture subprocess trigger: messages starting with "!"
+        # If a message begins with "!" we run the inbox_capture.py script as
+        # an async subprocess, pass the payload JSON via a temp file, send the
+        # script stdout as reply, and RETURN (do not enqueue for the agent).
+        # ------------------------------------------------------------------
+        try:
+            raw_text = (msg.text or "")
+            # Consider messages that start with '!' after any leading whitespace
+            if raw_text.lstrip().startswith("!"):
+                # Remove leading '!' and any following whitespace
+                stripped = raw_text.lstrip()
+                body = stripped[1:].lstrip()
+
+                # Build payload JSON
+                payload = {
+                    "from": {
+                        "id": str(getattr(getattr(msg, "from_user", None), "id", "") or ""),
+                        "name": getattr(getattr(msg, "from_user", None), "full_name", "") or "",
+                    },
+                    "text": body,
+                    "message_id": str(getattr(msg, "message_id", "") or "")
+                }
+
+                import tempfile, json, sys, os, asyncio as _asyncio
+
+                tmpf = None
+                try:
+                    # Write payload to a temp file
+                    tf = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json", encoding="utf-8")
+                    json.dump(payload, tf, ensure_ascii=False)
+                    tf.flush()
+                    tmpf = tf.name
+                    tf.close()
+
+                    # Launch subprocess: use the same Python executable
+                    script_path = "/home/cassantos/.hermes/skills/productivity/inbox-capture/scripts/inbox_capture.py"
+                    proc = await _asyncio.create_subprocess_exec(
+                        sys.executable, script_path, "--payload-file", tmpf,
+                        stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE
+                    )
+                    out_bytes, err_bytes = await proc.communicate()
+                    # Clean up temp file
+                    try:
+                        os.unlink(tmpf)
+                    except Exception:
+                        pass
+
+                    stdout_text = out_bytes.decode("utf-8", errors="replace").strip() if out_bytes else ""
+                    stderr_text = err_bytes.decode("utf-8", errors="replace").strip() if err_bytes else ""
+
+                    if proc.returncode == 0:
+                        reply = stdout_text or "✅ Capturado."
+                        # Send reply to the chat
+                        await self.send(str(msg.chat.id), reply)
+                    else:
+                        logger.exception("inbox-capture subprocess failed (rc=%s): %s", proc.returncode, stderr_text)
+                        err_msg = f"⚠️ Falha ao processar a captura (rc={proc.returncode})."
+                        if stderr_text:
+                            err_msg += f" Detalhe: {stderr_text[:800]}"
+                        await self.send(str(msg.chat.id), err_msg)
+                except Exception as e_sub:
+                    logger.exception("Failed to run inbox-capture subprocess: %s", e_sub)
+                    try:
+                        if tmpf and os.path.exists(tmpf):
+                            os.unlink(tmpf)
+                    except Exception:
+                        pass
+                    await self.send(str(msg.chat.id), "⚠️ Erro interno ao processar a captura.")
+                # In every case, do NOT enqueue to the agent — we've handled it here.
+                return
+        except Exception:
+            # Non-fatal: fall through to normal processing if something unexpected happens
+            logger.exception("Unexpected error in inbox-capture trigger path")
+        # --- message_triggers extension (prefix/regex routing) -------------
+        # If configured, allow simple regex-based triggers to route a message
+        # to a named skill and optionally strip the matched prefix before
+        # handing the text to the skill. This is a lightweight, robust
+        # in-adapter dispatcher that doesn't require Topics.
+        matched_skill = None
+        try:
+            triggers = []
+            if getattr(self.config, "extra", None) is not None:
+                triggers = self.config.extra.get("message_triggers", []) or []
+            # Accept JSON-string payloads for compatibility with CLI set calls
+            if isinstance(triggers, str):
+                try:
+                    triggers = json.loads(triggers)
+                except Exception:
+                    # Fall back to empty if parsing fails
+                    triggers = []
+            # Normalize dict -> list
+            if isinstance(triggers, dict):
+                triggers = [triggers]
+            if isinstance(triggers, list):
+                for trig in triggers:
+                    if not isinstance(trig, dict):
+                        continue
+                    pattern = trig.get("pattern")
+                    skill = trig.get("skill")
+                    strip_prefix = bool(trig.get("strip_prefix", True))
+                    if not pattern or not skill:
+                        continue
+                    try:
+                        # re.match to anchor at start when pattern uses ^, but allow any regex
+                        m = re.match(pattern, msg.text or "")
+                    except re.error:
+                        # ignore invalid regexes
+                        continue
+                    if m:
+                        matched_skill = skill
+                        if strip_prefix:
+                            # remove only the matched portion (so complex patterns also work)
+                            remaining = (msg.text or "")[m.end():]
+                            msg.text = remaining.lstrip()
+                        break
+        except Exception:
+            logger.debug("[%s] message_triggers processing failed", self.name, exc_info=True)
+
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        # If a trigger matched, force the auto_skill so gateway will auto-load it
+        # on new sessions (gateway/run.py uses event.auto_skill to inject skill text).
+        if matched_skill:
+            try:
+                event.auto_skill = matched_skill
+            except Exception:
+                logger.debug("[%s] Failed to set event.auto_skill = %s", self.name, matched_skill, exc_info=True)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
